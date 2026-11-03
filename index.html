@@ -482,6 +482,34 @@ body{
   color:var(--rose-gold);
   opacity:.9;
 }
+.notification-status{
+  min-height:1.4em;
+  margin:12px 0 0;
+  font-size:.82rem;
+  color:var(--ink-soft);
+}
+.btn-download{
+  margin-top:20px;
+  border:1px solid rgba(201,85,110,.28);
+  border-radius:999px;
+  padding:12px 22px;
+  color:var(--rose-deep);
+  background:rgba(255,255,255,.72);
+  font:inherit;
+  font-size:.9rem;
+  font-weight:700;
+  cursor:pointer;
+  box-shadow:0 8px 18px -12px rgba(201,85,110,.7);
+  transition:transform .2s ease, box-shadow .2s ease;
+}
+.btn-download:hover{
+  transform:translateY(-2px);
+  box-shadow:0 12px 22px -12px rgba(201,85,110,.8);
+}
+.btn-download:focus-visible{
+  outline:2px solid var(--gold);
+  outline-offset:3px;
+}
 
 /* ============================================================
    8. MOTION PREFERENCES
@@ -550,25 +578,17 @@ body{
     </div>
   </div>
   <p class="win-note">Keep this card — it's your claim ticket 💌</p>
+  <p class="notification-status" id="notificationStatus" role="status" aria-live="polite"></p>
+  <button class="btn-download" id="downloadCouponBtn" type="button">Download your gift coupon</button>
 </section>
 
 <script>
 /* ================================================================
    ⚙️  CONFIG — EDIT EVERYTHING IN THIS BLOCK
    ================================================================
-   HOW TO SET UP NOTIFICATIONS (Option A — Discord, recommended):
-     1. In Discord: Server Settings → Integrations → Webhooks → New Webhook
-     2. Pick the private channel you want the notification in, then
-        "Copy Webhook URL".
-     3. Paste it below into DISCORD_WEBHOOK_URL.
-     That's it. No server, no build step. It works from the browser.
-
-   HOW TO SET UP NOTIFICATIONS (Option B — Email via Formspree):
-     1. Create a free form at https://formspree.io (it gives you an endpoint
-        like https://formspree.io/f/abcdwxyz).
-     2. Paste it into FORMSPREE_ENDPOINT below.
-     3. You'll receive an email the moment she wins.
-     (If both are set, Discord is tried first and Formspree is the fallback.)
+   NOTIFICATIONS:
+     The Cloudflare Worker URL is public and contains no Discord secret. Keep
+     the Discord webhook stored as a Worker secret in Cloudflare.
 
    HOW TO EDIT THE GIFTS:
      Just change the strings in the GIFTS array. You can add or remove
@@ -580,11 +600,8 @@ const CONFIG = {
   /* Her name — shown to you in the notification */
   HER_NAME: "Vangi Ji",
 
-  /* 👇 PASTE YOUR DISCORD WEBHOOK URL HERE */
-  DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/REVOKED/REDACTED",
-
-  /* 👇 (Optional) PASTE YOUR FORMSPREE ENDPOINT HERE */
-  FORMSPREE_ENDPOINT: "",
+  /* Public Cloudflare Worker endpoint; never put the Discord webhook here. */
+  CLOUDFLARE_WORKER_URL: "https://surprise-game-proxy.abhaysoni.workers.dev",
 
   /* The 10 gifts — swap the text freely */
   GIFTS: [
@@ -764,7 +781,6 @@ function loopConfetti(){
     p.rot += p.vr;
     p.life++;
 
-    // fade out near the end of life
     const fadeStart = p.ttl * 0.6;
     const alpha = p.life > fadeStart
       ? Math.max(0, 1 - (p.life - fadeStart) / (p.ttl - fadeStart))
@@ -804,11 +820,11 @@ function showScreen(id){
    ================================================================ */
 const giftGrid = document.getElementById("giftGrid");
 let gameLocked = false;
+let currentResult = null;
 
 function buildGiftGrid(){
   giftGrid.innerHTML = "";
 
-  // Shuffle so the gift-to-box mapping is random every game
   const giftOrder = shuffle(CONFIG.GIFTS.map((_, i) => i));
 
   giftOrder.forEach((giftIndex, boxIndex) => {
@@ -838,10 +854,8 @@ function pickGift(button, giftIndex){
   if(gameLocked) return;
   gameLocked = true;
 
-  // Lock every box
   document.querySelectorAll(".gift").forEach(b => { b.disabled = true; });
 
-  // Visual feedback
   giftGrid.classList.add("dimmed");
   button.classList.add("picked");
 
@@ -849,17 +863,46 @@ function pickGift(button, giftIndex){
   const result = {
     gift: giftName,
     time: new Date().toISOString(),
-    notified: false,
-    attempts: 0
+    notificationStatus: "pending"
   };
 
-  // Persist immediately → refreshing will still show the win screen
   saveResult(result);
 
-  // Send notification to the backend
-  sendNotification(result);
+  const status = document.getElementById("notificationStatus");
+  status.textContent = "Sending your win notification…";
 
-  // Let the box-open animation play, then reveal the card
+  try{
+    const workerUrl = new URL(CONFIG.CLOUDFLARE_WORKER_URL);
+    if(workerUrl.protocol !== "https:" || workerUrl.hostname === "discord.com"){
+      throw new Error("The notification URL must be a Cloudflare HTTPS endpoint.");
+    }
+
+    fetch(workerUrl.href, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        name:CONFIG.HER_NAME,
+        gift:result.gift,
+        time:result.time
+      })
+    }).then(response => {
+      if(!response.ok) throw new Error(`Cloudflare Worker responded with ${response.status}.`);
+      result.notificationStatus = "sent";
+      saveResult(result);
+      status.textContent = "Your win notification was sent successfully.";
+    }).catch(error => {
+      console.warn("Cloudflare notification failed:", error);
+      result.notificationStatus = "failed";
+      saveResult(result);
+      status.textContent = "Your win was saved, but its notification could not be sent.";
+    });
+  }catch(error){
+    console.warn("Cloudflare notification URL is invalid:", error);
+    result.notificationStatus = "failed";
+    saveResult(result);
+    status.textContent = "The notification service is not configured correctly.";
+  }
+
   setTimeout(() => {
     showWinScreen(result, false);
   }, 950);
@@ -869,13 +912,24 @@ function pickGift(button, giftIndex){
    WIN SCREEN
    ================================================================ */
 function showWinScreen(result, isReturnVisit){
+  currentResult = result;
   showScreen("screenWin");
 
   document.getElementById("winGift").textContent = result.gift;
   document.getElementById("winMsg").textContent  = randomFrom(SWEET_MESSAGES);
   document.getElementById("winDate").textContent = formatDate(result.time);
 
-  // Big celebration on first win, gentle sprinkle on return visits
+  const notificationStatus = document.getElementById("notificationStatus");
+  if(result.notificationStatus === "sent"){
+    notificationStatus.textContent = "Your win notification was sent successfully.";
+  }else if(result.notificationStatus === "failed"){
+    notificationStatus.textContent = "Your win was saved, but its notification could not be sent.";
+  }else{
+    notificationStatus.textContent = result.notificationStatus === "pending"
+      ? "Your win notification is being sent…"
+      : "Notification status is unavailable.";
+  }
+
   setTimeout(() => burstConfetti(isReturnVisit ? 60 : 170), 180);
   if(!isReturnVisit){
     setTimeout(() => burstConfetti(90), 700);
@@ -883,78 +937,160 @@ function showWinScreen(result, isReturnVisit){
 }
 
 /* ================================================================
-   BACKEND NOTIFICATION
+   COUPON DOWNLOAD
    ================================================================ */
-async function sendNotification(result){
-  let sent = false;
+function downloadCoupon(result){
+  if(!result || typeof result.gift !== "string"){
+    console.warn("The gift coupon could not be created because the result is unavailable.");
+    return;
+  }
 
-  const readableTime = new Date(result.time).toLocaleString();
+  const canvas = document.createElement("canvas");
+  canvas.width = 1200;
+  canvas.height = 1500;
+  const ctx = canvas.getContext("2d");
+  if(!ctx){
+    console.error("The gift coupon image could not be created: canvas is unavailable.");
+    window.alert("Sorry, the coupon image could not be created in this browser.");
+    return;
+  }
 
-  /* ---------- Option A: Discord webhook ---------- */
-  if(CONFIG.DISCORD_WEBHOOK_URL){
-    try{
-      const res = await fetch(CONFIG.DISCORD_WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: "Surprise Game 💝",
-          content: `💖 **${CONFIG.HER_NAME}** just played the surprise game!`,
-          embeds: [{
-            title: "🎁 Gift Unlocked",
-            description: `She won: **${result.gift}**`,
-            color: 0xE8798F,
-            fields: [
-              { name: "Name",  value: CONFIG.HER_NAME, inline: true },
-              { name: "Gift",  value: result.gift,     inline: true },
-              { name: "Time",  value: readableTime,    inline: false }
-            ],
-            footer: { text: "Sent from the Surprise Game 💝" }
-          }]
-        })
-      });
-      sent = res.ok;
-      if(!res.ok) console.warn("Discord webhook responded with", res.status);
-    }catch(err){
-      console.warn("Discord webhook failed:", err);
+  const roundedRect = (x, y, width, height, radius) => {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + width - radius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+    ctx.lineTo(x + width, y + height - radius);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+    ctx.lineTo(x + radius, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+  };
+
+  const wrapText = (text, maxWidth) => {
+    const lines = [];
+    let line = "";
+    String(text).split(/\s+/).forEach(word => {
+      if(ctx.measureText(word).width > maxWidth){
+        if(line){ lines.push(line); line = ""; }
+        let part = "";
+        for(const char of word){
+          if(part && ctx.measureText(part + char).width > maxWidth){
+            lines.push(part);
+            part = char;
+          }else{
+            part += char;
+          }
+        }
+        line = part;
+      }else{
+        const candidate = line ? line + " " + word : word;
+        if(line && ctx.measureText(candidate).width > maxWidth){
+          lines.push(line);
+          line = word;
+        }else{
+          line = candidate;
+        }
+      }
+    });
+    if(line) lines.push(line);
+    return lines;
+  };
+
+  const background = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+  background.addColorStop(0, "#fffafc");
+  background.addColorStop(1, "#ffe9f1");
+  ctx.fillStyle = background;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.shadowColor = "rgba(190,90,120,.22)";
+  ctx.shadowBlur = 36;
+  ctx.shadowOffsetY = 18;
+  roundedRect(70, 70, 1060, 1360, 42);
+  ctx.fillStyle = "#fffdfb";
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  roundedRect(92, 92, 1016, 1316, 30);
+  ctx.setLineDash([12, 12]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(217,168,108,.8)";
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e8798f";
+  ctx.font = "96px 'Segoe UI Emoji', 'Apple Color Emoji', sans-serif";
+  ctx.fillText("💝", 600, 300);
+  ctx.fillStyle = "#c98a7a";
+  ctx.font = "700 26px Arial, sans-serif";
+  ctx.fillText("C O N G R A T U L A T I O N S", 600, 390);
+  ctx.fillStyle = "#c9556e";
+  ctx.font = "600 76px Georgia, serif";
+  ctx.fillText("Your Gift Coupon", 600, 500);
+
+  const divider = ctx.createLinearGradient(260, 0, 940, 0);
+  divider.addColorStop(0, "rgba(217,168,108,0)");
+  divider.addColorStop(.5, "#d9a86c");
+  divider.addColorStop(1, "rgba(217,168,108,0)");
+  ctx.fillStyle = divider;
+  ctx.fillRect(260, 550, 680, 3);
+
+  ctx.fillStyle = "#8a6371";
+  ctx.font = "32px Arial, sans-serif";
+  ctx.fillText("This coupon is good for:", 600, 660);
+
+  roundedRect(160, 710, 880, 300, 28);
+  const giftBackground = ctx.createLinearGradient(160, 710, 1040, 1010);
+  giftBackground.addColorStop(0, "#fff0f5");
+  giftBackground.addColorStop(1, "#ffe1eb");
+  ctx.fillStyle = giftBackground;
+  ctx.fill();
+
+  let giftFontSize = 58;
+  let giftLines;
+  do{
+    ctx.font = `700 ${giftFontSize}px Georgia, serif`;
+    giftLines = wrapText(result.gift, 760);
+    if(giftLines.length <= 3 || giftFontSize <= 38) break;
+    giftFontSize -= 4;
+  }while(true);
+
+  ctx.fillStyle = "#c9556e";
+  ctx.font = `700 ${giftFontSize}px Georgia, serif`;
+  const lineHeight = giftFontSize * 1.3;
+  const firstLineY = 860 - ((giftLines.length - 1) * lineHeight) / 2;
+  giftLines.forEach((line, index) => {
+    ctx.fillText(line, 600, firstLineY + index * lineHeight, 800);
+  });
+
+  ctx.fillStyle = "#8a6371";
+  ctx.font = "30px Arial, sans-serif";
+  ctx.fillText("A little reminder that you are so, so loved. ❤️", 600, 1110, 900);
+  ctx.fillStyle = "#c98a7a";
+  ctx.font = "700 22px Arial, sans-serif";
+  ctx.fillText(`W O N  O N  ${formatDate(result.time).toUpperCase()}`, 600, 1260);
+
+  canvas.toBlob(file => {
+    if(!file){
+      console.error("The gift coupon PNG could not be generated.");
+      window.alert("Sorry, the coupon image could not be generated. Please try again.");
+      return;
     }
-  }
 
-  /* ---------- Option B: Formspree email fallback ---------- */
-  if(!sent && CONFIG.FORMSPREE_ENDPOINT){
-    try{
-      const res = await fetch(CONFIG.FORMSPREE_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({
-          subject: "💝 She played the surprise game!",
-          name: CONFIG.HER_NAME,
-          gift: result.gift,
-          time: readableTime
-        })
-      });
-      sent = res.ok;
-    }catch(err){
-      console.warn("Formspree failed:", err);
-    }
-  }
-
-  if(!CONFIG.DISCORD_WEBHOOK_URL && !CONFIG.FORMSPREE_ENDPOINT){
-    console.info(
-      "ℹ️ No notification endpoint configured yet.\n" +
-      "Result (also stored locally):", result.gift
-    );
-  }
-
-  // Remember whether it went through, so we can retry on a later visit
-  const stored = loadResult();
-  if(stored){
-    stored.notified = sent;
-    stored.attempts = (stored.attempts || 0) + 1;
-    saveResult(stored);
-  }
-
-  console.log(sent ? "✅ Winner notification sent." : "⚠️ Notification not sent.");
-  return sent;
+    const url = URL.createObjectURL(file);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "your-gift-coupon.png";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, "image/png");
 }
 
 /* ================================================================
@@ -967,18 +1103,19 @@ async function sendNotification(result){
   startBtn.addEventListener("click", () => {
     showScreen("screenGame");
   });
+  document.getElementById("downloadCouponBtn").addEventListener("click", () => {
+    downloadCoupon(currentResult);
+  });
 
   // ---- Anti-cheat: if she already won, jump straight to her result ----
   const existing = loadResult();
   if(existing && existing.gift){
     gameLocked = true;
-    showWinScreen(existing, true);
-
-    // Retry a failed notification (max 3 attempts, so no spam)
-    const endpointExists = CONFIG.DISCORD_WEBHOOK_URL || CONFIG.FORMSPREE_ENDPOINT;
-    if(!existing.notified && endpointExists && (existing.attempts || 0) < 3){
-      sendNotification(existing);
+    if(existing.notificationStatus === "pending"){
+      existing.notificationStatus = "unknown";
+      saveResult(existing);
     }
+    showWinScreen(existing, true);
   }
 })();
 </script>
